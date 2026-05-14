@@ -49,7 +49,8 @@ With this server, the agent can do the work against GitLab directly:
 
 - List labels in the current project to discover the exact status or workflow names in use.
 - List issues by state, assignee, and project labels, with case-insensitive exact matching like `bug` -> `Bug` and unique shorthands like `blocked` -> `Status Blocked`.
-- Read a full issue or ticket.
+- Read a full issue or ticket, including its **Work Item Status** (e.g. `In Dev Review`, `Ready for QA`) when the project uses GitLab's Work Items feature.
+- Read the Work Item Status of a specific issue directly, without fetching all issue details.
 - Read issue comments in chronological order.
 - Create issues.
 - Add issue comments.
@@ -119,7 +120,9 @@ Example prompts:
 | Tool | Purpose |
 |---|---|
 | `list_issues` | List issues by state, assignee, and resolved project labels such as `bug` -> `Bug` or `blocked` -> `Status Blocked` |
-| `get_issue` | Read a full issue or ticket by IID |
+| `get_issue` | Read a full issue or ticket by IID, including Work Item Status when available |
+| `list_work_item_statuses` | List all work items with their Work Item Status in a single GraphQL call — useful for a full project status overview |
+| `get_issue_status` | Read the Work Item Status of a specific issue (e.g. `In Dev Review`, `Ready for QA`) via GraphQL |
 | `get_issue_comments` | Read issue comments in chronological order |
 | `create_issue` | Create a new issue |
 | `add_issue_comment` | Add an audited comment to an issue |
@@ -378,14 +381,22 @@ Codex launches the MCP server command when needed. You do not need to keep a sep
 
 ## Notes
 
-- The server targets the GitLab REST API v4.
+- The server targets the GitLab REST API v4 for most operations, and the GitLab GraphQL API for Work Item Status.
 - All list-style tools default to `per_page=20` and support up to `100` where GitLab allows it.
-- `get_issue` and `get_issue_comments` accept `iid`, `issue`, or `ticket` as the issue identifier.
+- `get_issue`, `get_issue_status`, and `get_issue_comments` accept `iid`, `issue`, or `ticket` as the issue identifier.
 - Invalid project-selection errors are returned as tool text so the agent can recover more gracefully.
 - GitLab API permission errors are also surfaced back as tool text rather than opaque failures.
 - `list_projects` can still be scoped explicitly with a `group` argument when the user wants to narrow discovery to a specific organization or subgroup.
 - System notes are filtered out from issue and MR comment reads; only user-authored comments are returned.
 - File contents returned by `get_file_contents` are automatically base64-decoded.
+
+### Work Item Status
+
+The **Status** field (e.g. `In Dev Review`, `Ready for QA`) is part of GitLab's new Work Items system and is not exposed by the REST API. This server fetches it via the GitLab GraphQL Work Items API.
+
+`get_issue` fetches the Work Item Status automatically in the background and includes it in the response when available. `get_issue_status` provides a dedicated tool to query only the status of a single issue. `list_work_item_statuses` retrieves all work items in a project with their statuses in a single GraphQL call — useful for a full status overview.
+
+If a project does not have the Work Items feature or the Status widget enabled, the status field will be absent from `get_issue`, and `get_issue_status` and `set_work_item_status` will return a descriptive message instead of failing.
 
 ---
 

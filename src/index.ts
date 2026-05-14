@@ -403,14 +403,21 @@ function isGitLabStatusError(error: unknown, status: number): error is McpError 
   return error instanceof McpError && error.message.startsWith(`GitLab API error ${status}:`);
 }
 
-function renderIssueDetails(issue: Issue, project: ProjectRef): string {
+function renderIssueDetails(issue: Issue, project: ProjectRef, workItemStatus?: string | null): string {
   const assignees = issue.assignees.map((a) => `${a.name} (@${a.username})`).join(", ") || "unassigned";
 
-  return [
+  const lines = [
     `## Issue #${issue.iid}: ${issue.title}`,
     "",
     `**Project:** ${project.raw}`,
     `**State:** ${issue.state}`,
+  ];
+
+  if (workItemStatus !== undefined) {
+    lines.push(`**Work Item Status:** ${workItemStatus ?? "_(not set)_"}`);
+  }
+
+  lines.push(
     `**Author:** ${issue.author.name} (@${issue.author.username})`,
     `**Assignees:** ${assignees}`,
     `**Labels:** ${issue.labels.join(", ") || "none"}`,
@@ -423,8 +430,10 @@ function renderIssueDetails(issue: Issue, project: ProjectRef): string {
     `**URL:** ${issue.web_url}`,
     "",
     "### Description",
-    issue.description || "_No description provided._",
-  ].join("\n");
+    issue.description || "_No description provided._"
+  );
+
+  return lines.join("\n");
 }
 
 function renderProjectCatalog(projects: ProjectSummary[]): string {
@@ -702,6 +711,115 @@ function textResult(text: string) {
   return {
     content: [{ type: "text" as const, text }],
   };
+}
+
+// ---------------------------------------------------------------------------
+// GitLab GraphQL helpers (Work Items API — status not available in REST)
+// ---------------------------------------------------------------------------
+
+async function gitlabGraphQL<T = unknown>(
+  query: string,
+  variables?: Record<string, unknown>
+): Promise<T> {
+  const url = `${GITLAB_BASE_URL}/api/graphql`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "PRIVATE-TOKEN": GITLAB_TOKEN!,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  if (!response.ok) {
+    let detail: string;
+    try {
+      const err = (await response.json()) as { message?: string; error?: string };
+      detail = err.message ?? err.error ?? "";
+    } catch {
+      detail = await response.text();
+    }
+    throw new McpError(
+      ErrorCode.InternalError,
+      `GitLab GraphQL error ${response.status}: ${detail || response.statusText}`
+    );
+  }
+
+  const result = (await response.json()) as {
+    data?: T;
+    errors?: Array<{ message: string }>;
+  };
+
+  if (result.errors && result.errors.length > 0) {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `GitLab GraphQL errors: ${result.errors.map((e) => e.message).join(", ")}`
+    );
+  }
+
+  return result.data as T;
+}
+
+interface WorkItemStatusInfo {
+  iid: string;
+  title: string;
+  status: string | null;
+}
+
+const WORK_ITEM_STATUS_QUERY = `
+  query GetWorkItemStatus($fullPath: ID!, $iids: [String!]) {
+    project(fullPath: $fullPath) {
+      workItems(iids: $iids) {
+        nodes {
+          iid
+          title
+          widgets {
+            ... on WorkItemWidgetStatus {
+              status {
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+async function fetchWorkItemStatus(
+  projectFullPath: string,
+  iid: number
+): Promise<WorkItemStatusInfo | null> {
+  try {
+    const data = await gitlabGraphQL<{
+      project: {
+        workItems: {
+          nodes: Array<{
+            iid: string;
+            title: string;
+            widgets: Array<{ status?: { name: string } }>;
+          }>;
+        } | null;
+      } | null;
+    }>(WORK_ITEM_STATUS_QUERY, { fullPath: projectFullPath, iids: [String(iid)] });
+
+    const workItem = data?.project?.workItems?.nodes?.[0];
+    if (!workItem) return null;
+
+    const statusWidget = workItem.widgets.find(
+      (w): w is { status: { name: string } } => "status" in w && w.status != null
+    );
+
+    return {
+      iid: workItem.iid,
+      title: workItem.title,
+      status: statusWidget?.status.name ?? null,
+    };
+  } catch {
+    // GraphQL status fetch is best-effort — don't fail the whole request
+    return null;
+  }
 }
 
 function getAuditClientLabel(): string {
@@ -1269,6 +1387,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: ["close", "reopen"],
             description: "Close or reopen the issue",
+          },
+        },
+      },
+    },
+    {
+      name: "list_work_item_statuses",
+      description:
+        `List all work items in a project with their Work Item Status in a single call. Uses the GitLab GraphQL Work Items API because the status field is not available in the REST API. Useful for getting a full status overview of all tickets in a project. ${explicitProjectGuidance}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: projectInputSchema,
+          per_page: {
+            type: "number",
+            description: "Maximum number of work items to return (default: 100, max: 100)",
+          },
+        },
+      },
+    },
+    {
+      name: "get_issue_status",
+      description:
+        `Get the Work Item status of a specific GitLab issue or ticket (e.g. "In Dev Review", "Ready for QA"). Uses the GraphQL Work Items API because the status field is not available in the REST API. ${explicitProjectGuidance}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: projectInputSchema,
+          iid: {
+            type: "number",
+            description: "The internal ID (IID) of the issue",
+          },
+          issue: {
+            type: "number",
+            description: "Alias for the internal issue ID (IID)",
+          },
+          ticket: {
+            type: "number",
+            description: "Alias for the internal issue ID (IID)",
           },
         },
       },
@@ -1867,7 +2023,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         setActiveProject(resolvedProject);
 
-        return { content: [{ type: "text", text: renderIssueDetails(issue!, resolvedProject) }] };
+        // Fetch Work Item status in parallel (best-effort — REST API doesn't expose it)
+        const workItemStatus = await fetchWorkItemStatus(resolvedProject.raw, iid);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderIssueDetails(issue!, resolvedProject, workItemStatus?.status ?? null),
+            },
+          ],
+        };
       }
 
       // ── get_issue_comments ───────────────────────────────────────────────
@@ -2030,6 +2196,119 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      // ── list_work_item_statuses ───────────────────────────────────────────
+      case "list_work_item_statuses": {
+        const { project: projectArg, per_page = 100 } = args as {
+          project?: string;
+          per_page?: number;
+        };
+        const project = await resolveProject(projectArg, { persist: true });
+        const limit = normalizePerPage(per_page, 100);
+
+        const query = `
+          query ListWorkItemStatuses($fullPath: ID!, $first: Int!) {
+            project(fullPath: $fullPath) {
+              workItems(first: $first) {
+                nodes {
+                  iid
+                  title
+                  state
+                  widgets {
+                    ... on WorkItemWidgetStatus {
+                      status {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `;
+
+        const data = await gitlabGraphQL<{
+          project: {
+            workItems: {
+              nodes: Array<{
+                iid: string;
+                title: string;
+                state: string;
+                widgets: Array<{ status?: { name: string } }>;
+              }>;
+            } | null;
+          } | null;
+        }>(query, { fullPath: project.raw, first: limit });
+
+        const nodes = data?.project?.workItems?.nodes ?? [];
+
+        if (nodes.length === 0) {
+          return textResult(`No work items found in ${project.raw}.`);
+        }
+
+        const lines = nodes.map((item) => {
+          const statusWidget = item.widgets.find(
+            (w): w is { status: { name: string } } => "status" in w && w.status != null
+          );
+          const status = statusWidget?.status.name ?? "_(not set)_";
+          return `| #${item.iid} | ${item.title} | ${item.state} | ${status} |`;
+        });
+
+        return textResult(
+          [
+            `## Work Item Statuses`,
+            ``,
+            `**Project:** ${project.raw}`,
+            `**Total:** ${nodes.length} work items`,
+            ``,
+            `| IID | Title | State | Work Item Status |`,
+            `|---|---|---|---|`,
+            ...lines,
+          ].join("\n")
+        );
+      }
+
+      // ── get_issue_status ─────────────────────────────────────────────────
+      case "get_issue_status": {
+        const { project: projectArg } = args as { project?: string };
+        const iid = getNumericIdentifier(args as Record<string, unknown>, ["iid", "issue", "ticket"], "Issue IID");
+        const project = await resolveProject(projectArg, { persist: false });
+
+        const statusInfo = await gitlabGraphQL<{
+          project: {
+            workItems: {
+              nodes: Array<{
+                iid: string;
+                title: string;
+                widgets: Array<{ status?: { name: string } }>;
+              }>;
+            } | null;
+          } | null;
+        }>(WORK_ITEM_STATUS_QUERY, { fullPath: project.raw, iids: [String(iid)] });
+
+        const workItem = statusInfo?.project?.workItems?.nodes?.[0];
+
+        if (!workItem) {
+          return textResult(
+            `Work item #${iid} was not found in ${project.raw} via the GraphQL Work Items API. Make sure the issue exists and the Work Items feature is enabled for this project.`
+          );
+        }
+
+        const statusWidget = workItem.widgets.find(
+          (w): w is { status: { name: string } } => "status" in w && w.status != null
+        );
+
+        const statusName = statusWidget?.status.name ?? null;
+
+        return textResult(
+          [
+            `## Work Item Status for #${iid}: ${workItem.title}`,
+            "",
+            `**Project:** ${project.raw}`,
+            `**Work Item Status:** ${statusName ?? "_(no status set — the Status widget may not be enabled for this project)_"}`,
+          ].join("\n")
+        );
       }
 
       // ── create_issue ─────────────────────────────────────────────────────

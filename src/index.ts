@@ -71,7 +71,8 @@ async function gitlabRequest<T>(
     }
     throw new McpError(
       ErrorCode.InternalError,
-      `GitLab API error ${response.status}: ${detail || response.statusText}`
+      `GitLab API error ${response.status}: ${detail || response.statusText}`,
+      { status: response.status }
     );
   }
 
@@ -400,7 +401,8 @@ function toProjectRef(project: ProjectSummary): ProjectRef {
 }
 
 function isGitLabStatusError(error: unknown, status: number): error is McpError {
-  return error instanceof McpError && error.message.startsWith(`GitLab API error ${status}:`);
+  // McpError prefixes its message with "MCP error <code>:", so match on the status stored in `data`
+  return error instanceof McpError && (error.data as { status?: number } | undefined)?.status === status;
 }
 
 function renderIssueDetails(issue: Issue, project: ProjectRef, workItemStatus?: string | null): string {
@@ -432,6 +434,78 @@ function renderIssueDetails(issue: Issue, project: ProjectRef, workItemStatus?: 
     "### Description",
     issue.description || "_No description provided._"
   );
+
+  return lines.join("\n");
+}
+
+function renderMergeRequestDetails(mr: MergeRequest, project: ProjectRef, extras: MergeRequestExtras): string {
+  const formatUsers = (users?: Array<{ username: string; name: string }>) =>
+    users?.map((u) => `${u.name} (@${u.username})`).join(", ") || "none";
+  const { approvals, relatedIssues, threads } = extras;
+
+  let approvalsLine = "_(unavailable)_";
+  if (approvals) {
+    approvalsLine = formatUsers(approvals.approved_by?.map((a) => a.user));
+    if (approvals.approvals_required !== undefined) {
+      approvalsLine += ` (${approvals.approvals_required} required, ${approvals.approvals_left ?? 0} left)`;
+    }
+  }
+
+  const pipeline = mr.head_pipeline
+    ? `${mr.head_pipeline.status} (#${mr.head_pipeline.id}) — ${mr.head_pipeline.web_url}`
+    : "none";
+
+  const comments = [`${mr.user_notes_count ?? 0} comments`];
+  if (threads) {
+    comments.push(`${threads.unresolved} of ${threads.resolvable} threads unresolved`);
+  }
+
+  const lines = [
+    `## MR !${mr.iid}: ${mr.title}`,
+    "",
+    `**Project:** ${project.raw}`,
+    `**State:** ${mr.state}${mr.draft ? " (draft)" : ""}`,
+    `**Author:** ${mr.author.name} (@${mr.author.username})`,
+    `**Assignees:** ${formatUsers(mr.assignees)}`,
+    `**Reviewers:** ${formatUsers(mr.reviewers)}`,
+    `**Approved by:** ${approvalsLine}`,
+    `**Branches:** \`${mr.source_branch}\` → \`${mr.target_branch}\``,
+    `**Labels:** ${mr.labels.join(", ") || "none"}`,
+    `**Milestone:** ${mr.milestone?.title ?? "none"}`,
+    `**Pipeline:** ${pipeline}`,
+    `**Changed files:** ${mr.changes_count ?? "unknown"}`,
+    `**Discussion:** ${comments.join(", ")}`,
+    `**Created:** ${mr.created_at}`,
+    `**Updated:** ${mr.updated_at}`,
+    `**Merged:** ${mr.merged_at ? `${mr.merged_at} by @${mr.merged_by?.username ?? "unknown"}` : "—"}`,
+    `**Closed:** ${mr.closed_at ?? "—"}`,
+    `**Head SHA:** ${mr.sha ?? "—"}`,
+    `**Merge commit SHA:** ${mr.merge_commit_sha ?? mr.squash_commit_sha ?? "—"}`,
+    `**URL:** ${mr.web_url}`,
+  ];
+
+  // Merge readiness is only meaningful while the MR is open
+  if (mr.state === "opened") {
+    lines.push(
+      "",
+      "### Merge readiness",
+      `- **Detailed merge status:** ${mr.detailed_merge_status ?? "unknown"}`,
+      `- **Conflicts:** ${mr.has_conflicts ? "yes" : "no"}`,
+      `- **Blocking threads resolved:** ${mr.blocking_discussions_resolved === false ? "no" : "yes"}`,
+      `- **Merge error:** ${mr.merge_error ?? "none"}`
+    );
+  }
+
+  lines.push("", "### Related issues");
+  if (relatedIssues === null) {
+    lines.push("_(unavailable)_");
+  } else if (relatedIssues.length === 0) {
+    lines.push("none");
+  } else {
+    lines.push(...relatedIssues.map((i) => `- #${i.iid}: ${i.title} (${i.state}) — ${i.web_url}`));
+  }
+
+  lines.push("", "### Description", mr.description || "_No description provided._");
 
   return lines.join("\n");
 }
@@ -822,6 +896,37 @@ async function fetchWorkItemStatus(
   }
 }
 
+/** GET that resolves to null on any error, for optional enrichment data */
+async function gitlabRequestOptional<T>(path: string, options?: GitLabApiOptions): Promise<T | null> {
+  try {
+    return await gitlabRequest<T>(path, options);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchMergeRequestThreadCounts(project: ProjectRef, iid: number): Promise<ThreadCounts | null> {
+  const counts: ThreadCounts = { resolvable: 0, unresolved: 0 };
+  const perPage = 100;
+
+  for (let page = 1; ; page += 1) {
+    const batch = await gitlabRequestOptional<Discussion[]>(
+      `/projects/${project.encoded}/merge_requests/${iid}/discussions`,
+      { params: { per_page: perPage, page } }
+    );
+    if (!batch) return null;
+
+    for (const discussion of batch) {
+      const resolvableNotes = discussion.notes.filter((n) => n.resolvable);
+      if (resolvableNotes.length === 0) continue;
+      counts.resolvable += 1;
+      if (!resolvableNotes.every((n) => n.resolved)) counts.unresolved += 1;
+    }
+
+    if (batch.length < perPage) return counts;
+  }
+}
+
 function getAuditClientLabel(): string {
   const client = server.getClientVersion();
   if (!client?.name) {
@@ -885,6 +990,52 @@ interface MergeRequest {
   updated_at: string;
   description: string;
   labels: string[];
+  draft?: boolean;
+  reviewers?: Array<{ username: string; name: string }>;
+  milestone: { title: string } | null;
+  merged_by: { username: string; name: string } | null;
+  merged_at: string | null;
+  closed_at: string | null;
+  detailed_merge_status?: string;
+  has_conflicts?: boolean;
+  blocking_discussions_resolved?: boolean;
+  merge_error?: string | null;
+  changes_count?: string | null;
+  user_notes_count?: number;
+  sha?: string | null;
+  merge_commit_sha?: string | null;
+  squash_commit_sha?: string | null;
+  head_pipeline?: { id: number; status: string; web_url: string } | null;
+}
+
+interface MergeRequestApprovals {
+  approved?: boolean;
+  approvals_required?: number;
+  approvals_left?: number;
+  approved_by?: Array<{ user: { username: string; name: string } }>;
+}
+
+interface RelatedIssue {
+  iid: number;
+  title: string;
+  state: string;
+  web_url: string;
+}
+
+interface Discussion {
+  id: string;
+  notes: Array<{ resolvable: boolean; resolved?: boolean }>;
+}
+
+interface ThreadCounts {
+  resolvable: number;
+  unresolved: number;
+}
+
+interface MergeRequestExtras {
+  approvals: MergeRequestApprovals | null;
+  relatedIssues: RelatedIssue[] | null;
+  threads: ThreadCounts | null;
 }
 
 interface Note {
@@ -1133,6 +1284,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "Number of results per page (default: 20, max: 100)",
           },
         },
+      },
+    },
+    {
+      name: "get_merge_request",
+      description:
+        `Get full details of a specific merge request by its IID, including title, description (body), state, branches, assignees, reviewers, approvals, head pipeline status, unresolved thread count, related issues, merge readiness (for open MRs), and commit SHAs. ${explicitProjectGuidance}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: projectInputSchema,
+          iid: {
+            type: "number",
+            description: "The internal ID (IID) of the merge request",
+          },
+        },
+        required: ["iid"],
       },
     },
     {
@@ -1682,6 +1849,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      // ── get_merge_request ────────────────────────────────────────────────
+      case "get_merge_request": {
+        const { project: projectArg, iid } = args as { project?: string; iid: number };
+        const project = await resolveProject(projectArg, { persist: true });
+        const mrPath = `/projects/${project.encoded}/merge_requests/${iid}`;
+
+        // Enrichment requests are best-effort and run in parallel with the main fetch
+        const extrasPromise = Promise.all([
+          gitlabRequestOptional<MergeRequestApprovals>(`${mrPath}/approvals`),
+          gitlabRequestOptional<RelatedIssue[]>(`${mrPath}/related_issues`, { params: { per_page: 100 } }),
+          fetchMergeRequestThreadCounts(project, iid),
+        ]);
+
+        let mr: MergeRequest;
+        try {
+          mr = await gitlabRequest<MergeRequest>(mrPath);
+        } catch (error) {
+          if (isGitLabStatusError(error, 404)) {
+            return textResult(
+              `MR !${iid} was not found in ${project.raw}. If you meant another repository, pass \`project\` explicitly or call \`select_project\` first.`
+            );
+          }
+          throw error;
+        }
+
+        const [approvals, relatedIssues, threads] = await extrasPromise;
+
+        return textResult(renderMergeRequestDetails(mr, project, { approvals, relatedIssues, threads }));
       }
 
       // ── get_merge_request_diff ───────────────────────────────────────────

@@ -59,6 +59,7 @@ With this server, the agent can do the work against GitLab directly:
 ### Merge request workflows
 
 - List merge requests by state and assignee.
+- Read a full MR, including its description, approvals, pipeline status, unresolved threads, related issues, and merge readiness.
 - Read the full diff of an MR.
 - Read MR comments.
 - Add MR comments.
@@ -133,6 +134,7 @@ Example prompts:
 | Tool | Purpose |
 |---|---|
 | `list_merge_requests` | List merge requests by state and assignee |
+| `get_merge_request` | Read a full MR by IID: description, reviewers, approvals, pipeline status, unresolved threads, related issues, and merge readiness |
 | `get_merge_request_diff` | Read the full MR diff |
 | `get_merge_request_comments` | Read MR discussion comments |
 | `add_merge_request_comment` | Add an audited comment to an MR |

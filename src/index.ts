@@ -405,13 +405,21 @@ function isGitLabStatusError(error: unknown, status: number): error is McpError 
   return error instanceof McpError && (error.data as { status?: number } | undefined)?.status === status;
 }
 
-function renderIssueDetails(issue: Issue, project: ProjectRef, workItemStatus?: string | null): string {
+const ISSUE_LINK_TYPE_LABELS: Record<IssueLink["link_type"], string> = {
+  relates_to: "relates to",
+  blocks: "blocks",
+  is_blocked_by: "blocked by",
+};
+
+function renderIssueDetails(issue: Issue, project: ProjectRef, extras: IssueExtras): string {
   const assignees = issue.assignees.map((a) => `${a.name} (@${a.username})`).join(", ") || "unassigned";
+  const { workItemStatus, relatedMergeRequests, links } = extras;
 
   const lines = [
     `## Issue #${issue.iid}: ${issue.title}`,
     "",
     `**Project:** ${project.raw}`,
+    `**Type:** ${issue.issue_type ?? "issue"}`,
     `**State:** ${issue.state}`,
   ];
 
@@ -419,21 +427,72 @@ function renderIssueDetails(issue: Issue, project: ProjectRef, workItemStatus?: 
     lines.push(`**Work Item Status:** ${workItemStatus ?? "_(not set)_"}`);
   }
 
+  const iteration = issue.iteration
+    ? `${issue.iteration.title ?? `Iteration ${issue.iteration.iid}`} (${issue.iteration.start_date} → ${issue.iteration.due_date}) — ${issue.iteration.web_url}`
+    : "none";
+
+  const tasks = issue.task_completion_status;
+  const checklist = tasks && tasks.count > 0 ? `${tasks.completed_count} of ${tasks.count} completed` : "none";
+
   lines.push(
+    `**Confidential:** ${issue.confidential ? "yes" : "no"}`,
     `**Author:** ${issue.author.name} (@${issue.author.username})`,
     `**Assignees:** ${assignees}`,
     `**Labels:** ${issue.labels.join(", ") || "none"}`,
     `**Milestone:** ${issue.milestone?.title ?? "none"}`,
+    `**Iteration:** ${iteration}`
+  );
+
+  if (issue.epic) {
+    lines.push(`**Epic:** &${issue.epic.iid} ${issue.epic.title}`);
+  }
+  if (issue.start_date) {
+    lines.push(`**Start date:** ${issue.start_date}`);
+  }
+
+  lines.push(
     `**Due date:** ${issue.due_date ?? "none"}`,
     `**Weight:** ${issue.weight ?? "none"}`,
+    `**Checklist:** ${checklist}`,
+    `**Comments:** ${issue.user_notes_count ?? 0}`
+  );
+
+  if (links) {
+    const openBlockers = links.filter((l) => l.link_type === "is_blocked_by" && l.state === "opened");
+    lines.push(`**Open blockers:** ${openBlockers.map((l) => `#${l.iid}`).join(", ") || "none"}`);
+  }
+
+  lines.push(
     `**Created:** ${issue.created_at}`,
     `**Updated:** ${issue.updated_at}`,
     `**Closed:** ${issue.closed_at ?? "—"}`,
     `**URL:** ${issue.web_url}`,
     "",
-    "### Description",
-    issue.description || "_No description provided._"
+    "### Related merge requests"
   );
+
+  if (relatedMergeRequests === null) {
+    lines.push("_(unavailable)_");
+  } else if (relatedMergeRequests.length === 0) {
+    lines.push("none");
+  } else {
+    lines.push(...relatedMergeRequests.map((mr) => `- !${mr.iid}: ${mr.title} (${mr.state}) — ${mr.web_url}`));
+  }
+
+  lines.push("", "### Linked issues");
+  if (links === null) {
+    lines.push("_(unavailable)_");
+  } else if (links.length === 0) {
+    lines.push("none");
+  } else {
+    lines.push(
+      ...links.map(
+        (l) => `- ${ISSUE_LINK_TYPE_LABELS[l.link_type] ?? l.link_type} #${l.iid}: ${l.title} (${l.state}) — ${l.web_url}`
+      )
+    );
+  }
+
+  lines.push("", "### Description", issue.description || "_No description provided._");
 
   return lines.join("\n");
 }
@@ -1015,7 +1074,7 @@ interface MergeRequestApprovals {
   approved_by?: Array<{ user: { username: string; name: string } }>;
 }
 
-interface RelatedIssue {
+interface RelatedItem {
   iid: number;
   title: string;
   state: string;
@@ -1034,7 +1093,7 @@ interface ThreadCounts {
 
 interface MergeRequestExtras {
   approvals: MergeRequestApprovals | null;
-  relatedIssues: RelatedIssue[] | null;
+  relatedIssues: RelatedItem[] | null;
   threads: ThreadCounts | null;
 }
 
@@ -1086,6 +1145,23 @@ interface Issue {
   milestone: { title: string } | null;
   due_date: string | null;
   weight: number | null;
+  issue_type?: string;
+  confidential?: boolean;
+  user_notes_count?: number;
+  start_date?: string | null;
+  task_completion_status?: { count: number; completed_count: number };
+  iteration?: { iid: number; title: string | null; start_date: string; due_date: string; web_url: string } | null;
+  epic?: { iid: number; title: string } | null;
+}
+
+interface IssueLink extends RelatedItem {
+  link_type: "relates_to" | "blocks" | "is_blocked_by";
+}
+
+interface IssueExtras {
+  workItemStatus?: string | null;
+  relatedMergeRequests: RelatedItem[] | null;
+  links: IssueLink[] | null;
 }
 
 interface ProjectLabel {
@@ -1426,7 +1502,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_issue",
       description:
-        `Get full details of a specific GitLab issue or ticket, including title, description, labels, assignees, and metadata. ${explicitProjectGuidance}`,
+        `Get full details of a specific GitLab issue or ticket, including title, description, labels, assignees, Work Item Status, iteration, checklist progress, related merge requests, linked issues (including open blockers), and metadata. ${explicitProjectGuidance}`,
       inputSchema: {
         type: "object",
         properties: {
@@ -1860,7 +1936,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Enrichment requests are best-effort and run in parallel with the main fetch
         const extrasPromise = Promise.all([
           gitlabRequestOptional<MergeRequestApprovals>(`${mrPath}/approvals`),
-          gitlabRequestOptional<RelatedIssue[]>(`${mrPath}/related_issues`, { params: { per_page: 100 } }),
+          gitlabRequestOptional<RelatedItem[]>(`${mrPath}/related_issues`, { params: { per_page: 100 } }),
           fetchMergeRequestThreadCounts(project, iid),
         ]);
 
@@ -2220,14 +2296,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         setActiveProject(resolvedProject);
 
-        // Fetch Work Item status in parallel (best-effort — REST API doesn't expose it)
-        const workItemStatus = await fetchWorkItemStatus(resolvedProject.raw, iid);
+        // Enrichment requests are best-effort and run in parallel. Work Item status
+        // comes from GraphQL because the REST API doesn't expose it.
+        const issuePath = `/projects/${resolvedProject.encoded}/issues/${iid}`;
+        const [workItemStatus, relatedMergeRequests, links] = await Promise.all([
+          fetchWorkItemStatus(resolvedProject.raw, iid),
+          gitlabRequestOptional<RelatedItem[]>(`${issuePath}/related_merge_requests`, { params: { per_page: 100 } }),
+          gitlabRequestOptional<IssueLink[]>(`${issuePath}/links`),
+        ]);
 
         return {
           content: [
             {
               type: "text",
-              text: renderIssueDetails(issue!, resolvedProject, workItemStatus?.status ?? null),
+              text: renderIssueDetails(issue!, resolvedProject, {
+                workItemStatus: workItemStatus?.status ?? null,
+                relatedMergeRequests,
+                links,
+              }),
             },
           ],
         };

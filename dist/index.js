@@ -283,18 +283,62 @@ function isGitLabStatusError(error, status) {
     // McpError prefixes its message with "MCP error <code>:", so match on the status stored in `data`
     return error instanceof types_js_1.McpError && error.data?.status === status;
 }
-function renderIssueDetails(issue, project, workItemStatus) {
+const ISSUE_LINK_TYPE_LABELS = {
+    relates_to: "relates to",
+    blocks: "blocks",
+    is_blocked_by: "blocked by",
+};
+function renderIssueDetails(issue, project, extras) {
     const assignees = issue.assignees.map((a) => `${a.name} (@${a.username})`).join(", ") || "unassigned";
+    const { workItemStatus, relatedMergeRequests, links } = extras;
     const lines = [
         `## Issue #${issue.iid}: ${issue.title}`,
         "",
         `**Project:** ${project.raw}`,
+        `**Type:** ${issue.issue_type ?? "issue"}`,
         `**State:** ${issue.state}`,
     ];
     if (workItemStatus !== undefined) {
         lines.push(`**Work Item Status:** ${workItemStatus ?? "_(not set)_"}`);
     }
-    lines.push(`**Author:** ${issue.author.name} (@${issue.author.username})`, `**Assignees:** ${assignees}`, `**Labels:** ${issue.labels.join(", ") || "none"}`, `**Milestone:** ${issue.milestone?.title ?? "none"}`, `**Due date:** ${issue.due_date ?? "none"}`, `**Weight:** ${issue.weight ?? "none"}`, `**Created:** ${issue.created_at}`, `**Updated:** ${issue.updated_at}`, `**Closed:** ${issue.closed_at ?? "—"}`, `**URL:** ${issue.web_url}`, "", "### Description", issue.description || "_No description provided._");
+    const iteration = issue.iteration
+        ? `${issue.iteration.title ?? `Iteration ${issue.iteration.iid}`} (${issue.iteration.start_date} → ${issue.iteration.due_date}) — ${issue.iteration.web_url}`
+        : "none";
+    const tasks = issue.task_completion_status;
+    const checklist = tasks && tasks.count > 0 ? `${tasks.completed_count} of ${tasks.count} completed` : "none";
+    lines.push(`**Confidential:** ${issue.confidential ? "yes" : "no"}`, `**Author:** ${issue.author.name} (@${issue.author.username})`, `**Assignees:** ${assignees}`, `**Labels:** ${issue.labels.join(", ") || "none"}`, `**Milestone:** ${issue.milestone?.title ?? "none"}`, `**Iteration:** ${iteration}`);
+    if (issue.epic) {
+        lines.push(`**Epic:** &${issue.epic.iid} ${issue.epic.title}`);
+    }
+    if (issue.start_date) {
+        lines.push(`**Start date:** ${issue.start_date}`);
+    }
+    lines.push(`**Due date:** ${issue.due_date ?? "none"}`, `**Weight:** ${issue.weight ?? "none"}`, `**Checklist:** ${checklist}`, `**Comments:** ${issue.user_notes_count ?? 0}`);
+    if (links) {
+        const openBlockers = links.filter((l) => l.link_type === "is_blocked_by" && l.state === "opened");
+        lines.push(`**Open blockers:** ${openBlockers.map((l) => `#${l.iid}`).join(", ") || "none"}`);
+    }
+    lines.push(`**Created:** ${issue.created_at}`, `**Updated:** ${issue.updated_at}`, `**Closed:** ${issue.closed_at ?? "—"}`, `**URL:** ${issue.web_url}`, "", "### Related merge requests");
+    if (relatedMergeRequests === null) {
+        lines.push("_(unavailable)_");
+    }
+    else if (relatedMergeRequests.length === 0) {
+        lines.push("none");
+    }
+    else {
+        lines.push(...relatedMergeRequests.map((mr) => `- !${mr.iid}: ${mr.title} (${mr.state}) — ${mr.web_url}`));
+    }
+    lines.push("", "### Linked issues");
+    if (links === null) {
+        lines.push("_(unavailable)_");
+    }
+    else if (links.length === 0) {
+        lines.push("none");
+    }
+    else {
+        lines.push(...links.map((l) => `- ${ISSUE_LINK_TYPE_LABELS[l.link_type] ?? l.link_type} #${l.iid}: ${l.title} (${l.state}) — ${l.web_url}`));
+    }
+    lines.push("", "### Description", issue.description || "_No description provided._");
     return lines.join("\n");
 }
 function renderMergeRequestDetails(mr, project, extras) {
@@ -942,7 +986,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_issue",
-            description: `Get full details of a specific GitLab issue or ticket, including title, description, labels, assignees, and metadata. ${explicitProjectGuidance}`,
+            description: `Get full details of a specific GitLab issue or ticket, including title, description, labels, assignees, Work Item Status, iteration, checklist progress, related merge requests, linked issues (including open blockers), and metadata. ${explicitProjectGuidance}`,
             inputSchema: {
                 type: "object",
                 properties: {
@@ -1595,13 +1639,23 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                     }
                 }
                 setActiveProject(resolvedProject);
-                // Fetch Work Item status in parallel (best-effort — REST API doesn't expose it)
-                const workItemStatus = await fetchWorkItemStatus(resolvedProject.raw, iid);
+                // Enrichment requests are best-effort and run in parallel. Work Item status
+                // comes from GraphQL because the REST API doesn't expose it.
+                const issuePath = `/projects/${resolvedProject.encoded}/issues/${iid}`;
+                const [workItemStatus, relatedMergeRequests, links] = await Promise.all([
+                    fetchWorkItemStatus(resolvedProject.raw, iid),
+                    gitlabRequestOptional(`${issuePath}/related_merge_requests`, { params: { per_page: 100 } }),
+                    gitlabRequestOptional(`${issuePath}/links`),
+                ]);
                 return {
                     content: [
                         {
                             type: "text",
-                            text: renderIssueDetails(issue, resolvedProject, workItemStatus?.status ?? null),
+                            text: renderIssueDetails(issue, resolvedProject, {
+                                workItemStatus: workItemStatus?.status ?? null,
+                                relatedMergeRequests,
+                                links,
+                            }),
                         },
                     ],
                 };

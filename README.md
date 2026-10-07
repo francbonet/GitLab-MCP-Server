@@ -50,6 +50,7 @@ With this server, the agent can do the work against GitLab directly:
 - List labels in the current project to discover the exact status or workflow names in use.
 - List issues by state, assignee, and project labels, with case-insensitive exact matching like `bug` -> `Bug` and unique shorthands like `blocked` -> `Status Blocked`.
 - Read a full issue or ticket, including its **Work Item Status** (e.g. `In Dev Review`, `Ready for QA`) when the project uses GitLab's Work Items feature.
+- See an issue's related merge requests, linked issues (including open blockers), iteration, and checklist progress in the same read.
 - Read the Work Item Status of a specific issue directly, without fetching all issue details.
 - Read issue comments in chronological order.
 - Create issues.
@@ -121,7 +122,7 @@ Example prompts:
 | Tool | Purpose |
 |---|---|
 | `list_issues` | List issues by state, assignee, and resolved project labels such as `bug` -> `Bug` or `blocked` -> `Status Blocked` |
-| `get_issue` | Read a full issue or ticket by IID, including Work Item Status when available |
+| `get_issue` | Read a full issue or ticket by IID, including Work Item Status, iteration, checklist progress, related MRs, and linked issues |
 | `list_work_item_statuses` | List all work items with their Work Item Status in a single GraphQL call — useful for a full project status overview |
 | `get_issue_status` | Read the Work Item Status of a specific issue (e.g. `In Dev Review`, `Ready for QA`) via GraphQL |
 | `get_issue_comments` | Read issue comments in chronological order |

@@ -4,6 +4,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const stdio_js_1 = require("@modelcontextprotocol/sdk/server/stdio.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
+const promises_1 = require("node:fs/promises");
+const node_path_1 = require("node:path");
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -50,6 +52,43 @@ async function gitlabRequest(path, { method = "GET", body, params } = {}) {
     if (response.status === 204)
         return undefined;
     return response.json();
+}
+const UPLOAD_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+};
+const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+/** Upload one local file to the project's uploads (multipart; gitlabRequest only sends JSON). */
+async function gitlabUpload(project, filePath) {
+    if (!(0, node_path_1.isAbsolute)(filePath)) {
+        throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, "file_path must be an absolute path.");
+    }
+    const mimeType = UPLOAD_MIME_TYPES[(0, node_path_1.extname)(filePath).toLowerCase()];
+    if (!mimeType) {
+        throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, `Unsupported file type. Allowed: ${Object.keys(UPLOAD_MIME_TYPES).join(", ")}`);
+    }
+    const { size } = await (0, promises_1.stat)(filePath);
+    if (size > UPLOAD_MAX_BYTES) {
+        throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, `File is ${size} bytes; the limit is ${UPLOAD_MAX_BYTES}.`);
+    }
+    const form = new FormData();
+    const bytes = new Uint8Array(await (0, promises_1.readFile)(filePath));
+    form.append("file", new Blob([bytes], { type: mimeType }), (0, node_path_1.basename)(filePath));
+    // No Content-Type header: fetch sets multipart/form-data with its boundary.
+    const response = await fetch(`${GITLAB_BASE_URL}/api/v4/projects/${project.encoded}/uploads`, {
+        method: "POST",
+        headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
+        body: form,
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new types_js_1.McpError(types_js_1.ErrorCode.InternalError, `GitLab upload error ${response.status}: ${detail || response.statusText}`, { status: response.status });
+    }
+    return (await response.json());
 }
 /** Encode a project ID for use in URL path segments */
 function encodeProject(id) {
@@ -1179,6 +1218,74 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
                 required: ["title"],
             },
         },
+        {
+            name: "create_merge_request",
+            description: `Open a merge request from a branch that already exists on the remote (push it first). To include screenshots, call \`upload_file\` first and paste the returned Markdown into \`description\`. Opens as a draft unless \`draft\` is false. The description is automatically marked as AI-generated for audit purposes. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    source_branch: {
+                        type: "string",
+                        description: "Branch with the changes; it must already exist on the remote",
+                    },
+                    target_branch: {
+                        type: "string",
+                        description: "Branch to merge into, for example `main` or `develop`",
+                    },
+                    title: {
+                        type: "string",
+                        description: "Merge request title, without a `Draft:` prefix",
+                    },
+                    description: {
+                        type: "string",
+                        description: "Merge request description (Markdown). Reference the issue with `Closes #<iid>` or `Related to #<iid>`.",
+                    },
+                    draft: {
+                        type: "boolean",
+                        description: "Open as a draft (default: true)",
+                    },
+                    labels: {
+                        type: "string",
+                        description: "Comma-separated list of label names to apply",
+                    },
+                    assignee_ids: {
+                        type: "array",
+                        items: { type: "number" },
+                        description: "User IDs to assign",
+                    },
+                    reviewer_ids: {
+                        type: "array",
+                        items: { type: "number" },
+                        description: "User IDs to request a review from",
+                    },
+                    remove_source_branch: {
+                        type: "boolean",
+                        description: "Delete the source branch after merge",
+                    },
+                },
+                required: ["source_branch", "target_branch", "title"],
+            },
+        },
+        {
+            name: "upload_file",
+            description: `Upload a local image or video (PNG, JPEG, GIF, WebP, MP4; at most 10 MB) to a project and return Markdown that embeds it in an issue, comment, or merge request description of the same project. \`file_path\` must be absolute. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    file_path: {
+                        type: "string",
+                        description: "Absolute path of the local file to upload",
+                    },
+                    alt: {
+                        type: "string",
+                        description: "Alt text for the returned Markdown (default: the file name)",
+                    },
+                },
+                required: ["file_path"],
+            },
+        },
         // ── Repository ───────────────────────────────────────────────────────────
         {
             name: "get_file_contents",
@@ -1858,6 +1965,45 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                     ],
                 };
             }
+            // ── create_merge_request ──────────────────────────────────────────────
+            case "create_merge_request": {
+                const { project: projectArg, source_branch, target_branch, title, description, draft = true, labels, assignee_ids, reviewer_ids, remove_source_branch, } = args;
+                const project = await resolveProject(projectArg, { persist: true });
+                const cleanTitle = title.trim();
+                // The REST API has no draft flag on create; GitLab reads the title prefix.
+                const finalTitle = draft && !/^(draft:|\[draft\]|\(draft\))/i.test(cleanTitle) ? `Draft: ${cleanTitle}` : cleanTitle;
+                const mr = await gitlabRequest(`/projects/${project.encoded}/merge_requests`, {
+                    method: "POST",
+                    body: {
+                        source_branch,
+                        target_branch,
+                        title: finalTitle,
+                        description: addAiAuditHeader(description, request.params._meta),
+                        labels,
+                        assignee_ids,
+                        reviewer_ids,
+                        remove_source_branch,
+                    },
+                });
+                return textResult([
+                    `✅ Merge request created in **${project.raw}**: **!${mr.iid} — ${mr.title}**`,
+                    `- **Branches:** \`${mr.source_branch}\` → \`${mr.target_branch}\``,
+                    `- **Draft:** ${mr.draft ? "yes" : "no"}`,
+                    `- **URL:** ${mr.web_url}`,
+                ].join("\n"));
+            }
+            // ── upload_file ───────────────────────────────────────────────────────
+            case "upload_file": {
+                const { project: projectArg, file_path, alt } = args;
+                const project = await resolveProject(projectArg, { persist: true });
+                const upload = await gitlabUpload(project, file_path);
+                const markdown = alt ? `![${alt}](${upload.url})` : upload.markdown;
+                return textResult([
+                    `✅ Uploaded \`${(0, node_path_1.basename)(file_path)}\` to **${project.raw}**. Paste this Markdown into the description or comment:`,
+                    "",
+                    markdown,
+                ].join("\n"));
+            }
             // ── get_file_contents ─────────────────────────────────────────────────
             case "get_file_contents": {
                 const { project: projectArg, file_path, ref = "main" } = args;
@@ -1920,7 +2066,7 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
     }
     catch (error) {
         if (error instanceof types_js_1.McpError && error.code !== types_js_1.ErrorCode.MethodNotFound) {
-            return textResult(error.message);
+            return { ...textResult(error.message), isError: true };
         }
         if (error instanceof types_js_1.McpError)
             throw error;

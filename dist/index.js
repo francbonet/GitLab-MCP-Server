@@ -760,6 +760,51 @@ function hasDefinedValue(value) {
         return value.length > 0;
     return true;
 }
+// GitLab treats a merge request as a draft when its title starts with one of these prefixes.
+const DRAFT_TITLE_PREFIX = /^(?:\s*(?:\[draft\]|\(draft\)|draft:|draft\s-\s))+\s*/i;
+/** The REST API has no draft flag; GitLab derives draft status from the title prefix. */
+function withDraftStatus(title, draft) {
+    const bareTitle = title.replace(DRAFT_TITLE_PREFIX, "").trim();
+    if (!bareTitle) {
+        throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, "Merge request title cannot be empty.");
+    }
+    return draft ? `Draft: ${bareTitle}` : bareTitle;
+}
+const ACCESS_LEVEL_NAMES = {
+    5: "Minimal access",
+    10: "Guest",
+    15: "Planner",
+    20: "Reporter",
+    30: "Developer",
+    40: "Maintainer",
+    50: "Owner",
+};
+/** Resolve GitLab usernames (with or without `@`) to user IDs. Fails on the first unknown username. */
+async function resolveUserIds(usernames) {
+    return Promise.all(usernames.map(async (raw) => {
+        const username = raw.trim().replace(/^@/, "");
+        const users = await gitlabRequest("/users", { params: { username } });
+        const user = users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+        if (!user) {
+            throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, `GitLab user \`@${username}\` was not found. Use \`list_project_members\` to look up the right username.`);
+        }
+        return user.id;
+    }));
+}
+function formatUsernames(users) {
+    return users?.map((u) => `@${u.username}`).join(", ") || "none";
+}
+/**
+ * Combine explicit user IDs with usernames to resolve. `undefined` means "leave unchanged";
+ * an empty array clears the assignees or reviewers on update.
+ */
+async function mergeUserIds(ids, usernames) {
+    if (ids === undefined && usernames === undefined)
+        return undefined;
+    const names = (typeof usernames === "string" ? usernames.split(",") : usernames ?? []).filter((u) => u.trim());
+    const resolved = await resolveUserIds(names);
+    return [...new Set([...(ids ?? []), ...resolved])];
+}
 const projectInputSchema = {
     type: "string",
     description: `Numeric GitLab project ID, namespace/path (for example \`group-name/project-name\`), a natural namespace-and-name form like \`group-name project-name\`, a short project name like \`project-name\`, or a full GitLab URL on this host. If omitted, the active project for the current MCP session is used. When the user names a repository or pastes a GitLab URL, pass \`project\` explicitly. Passing \`project\` also updates that active project. When repository names are ambiguous, consult the \`${PROJECT_CATALOG_URI}\` resource first.`,
@@ -865,6 +910,24 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
                     search: {
                         type: "string",
                         description: "Optional case-insensitive substring filter on label names",
+                    },
+                },
+            },
+        },
+        {
+            name: "list_project_members",
+            description: `List people with access to a project (including members inherited from parent groups), with their name, username, user ID, and role. Use it to find the username of a person named by the user before passing them as \`assignees\` or \`reviewers\`. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    query: {
+                        type: "string",
+                        description: "Optional filter on name or username, for example `marta` or `garcia`",
+                    },
+                    per_page: {
+                        type: "number",
+                        description: "Number of results (default: 20, max: 100)",
                     },
                 },
             },
@@ -1220,7 +1283,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         },
         {
             name: "create_merge_request",
-            description: `Open a merge request from a branch that already exists on the remote (push it first). To include screenshots, call \`upload_file\` first and paste the returned Markdown into \`description\`. Opens as a draft unless \`draft\` is false. The description is automatically marked as AI-generated for audit purposes. ${explicitProjectGuidance}`,
+            description: `Open a merge request from a branch that already exists on the remote (push it first). To include screenshots, call \`upload_file\` first and paste the returned Markdown into \`description\`. Pass \`assignees\` and \`reviewers\` as GitLab usernames; if the user names a person, call \`list_project_members\` first to find the username. Opens as a draft unless \`draft\` is false. The description is automatically marked as AI-generated for audit purposes. ${explicitProjectGuidance}`,
             inputSchema: {
                 type: "object",
                 properties: {
@@ -1249,15 +1312,25 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
                         type: "string",
                         description: "Comma-separated list of label names to apply",
                     },
+                    assignees: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "GitLab usernames to assign, with or without `@`",
+                    },
+                    reviewers: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "GitLab usernames to request a review from, with or without `@`",
+                    },
                     assignee_ids: {
                         type: "array",
                         items: { type: "number" },
-                        description: "User IDs to assign",
+                        description: "User IDs to assign (alternative to `assignees`)",
                     },
                     reviewer_ids: {
                         type: "array",
                         items: { type: "number" },
-                        description: "User IDs to request a review from",
+                        description: "User IDs to request a review from (alternative to `reviewers`)",
                     },
                     remove_source_branch: {
                         type: "boolean",
@@ -1265,6 +1338,78 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
                     },
                 },
                 required: ["source_branch", "target_branch", "title"],
+            },
+        },
+        {
+            name: "update_merge_request",
+            description: `Update an existing merge request: title, description, draft status, target branch, labels, assignees, reviewers, or state. Set \`draft: false\` to mark a draft as ready for review, or \`draft: true\` to turn it back into a draft. A new \`title\` keeps the current draft status unless \`draft\` is also passed. \`description\` replaces the whole description and is automatically marked as AI-generated for audit purposes. This tool does not merge. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    iid: {
+                        type: "number",
+                        description: "The internal ID (IID) of the merge request",
+                    },
+                    title: {
+                        type: "string",
+                        description: "New title, without a `Draft:` prefix",
+                    },
+                    description: {
+                        type: "string",
+                        description: "New description (Markdown). Replaces the existing description.",
+                    },
+                    draft: {
+                        type: "boolean",
+                        description: "`false` marks the MR as ready for review; `true` marks it as a draft",
+                    },
+                    target_branch: {
+                        type: "string",
+                        description: "New target branch",
+                    },
+                    labels: {
+                        type: "string",
+                        description: "Comma-separated list of labels to set, replacing the existing ones",
+                    },
+                    add_labels: {
+                        type: "string",
+                        description: "Comma-separated list of labels to add without replacing existing labels",
+                    },
+                    remove_labels: {
+                        type: "string",
+                        description: "Comma-separated list of labels to remove",
+                    },
+                    assignees: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "GitLab usernames to assign, replacing the current assignees. An empty array unassigns everyone.",
+                    },
+                    reviewers: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "GitLab usernames to request a review from, replacing the current reviewers. An empty array removes all reviewers.",
+                    },
+                    assignee_ids: {
+                        type: "array",
+                        items: { type: "number" },
+                        description: "User IDs to assign (alternative to `assignees`), replacing the current assignees",
+                    },
+                    reviewer_ids: {
+                        type: "array",
+                        items: { type: "number" },
+                        description: "User IDs to request a review from (alternative to `reviewers`), replacing the current reviewers",
+                    },
+                    remove_source_branch: {
+                        type: "boolean",
+                        description: "Delete the source branch after merge",
+                    },
+                    state_event: {
+                        type: "string",
+                        enum: ["close", "reopen"],
+                        description: "Close or reopen the merge request",
+                    },
+                },
+                required: ["iid"],
             },
         },
         {
@@ -1429,6 +1574,27 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                         },
                     ],
                 };
+            }
+            // ── list_project_members ─────────────────────────────────────────────
+            case "list_project_members": {
+                const { project: projectArg, query, per_page = 20 } = args;
+                const project = await resolveProject(projectArg, { persist: true });
+                const members = await gitlabRequest(`/projects/${project.encoded}/members/all`, {
+                    params: { query: query?.trim() || undefined, per_page: normalizePerPage(per_page) },
+                });
+                const active = members.filter((m) => !m.state || m.state === "active");
+                if (active.length === 0) {
+                    return textResult(query ? `No active members found in ${project.raw} matching "${query}".` : `No active members found in ${project.raw}.`);
+                }
+                const lines = active.map((m) => `- **${m.name}** (@${m.username}) — user ID ${m.id}, ${ACCESS_LEVEL_NAMES[m.access_level] ?? `access level ${m.access_level}`}`);
+                return textResult([
+                    "## Project members",
+                    "",
+                    `**Project:** ${project.raw}`,
+                    ...(query ? [`**Search:** ${query}`] : []),
+                    "",
+                    ...lines,
+                ].join("\n"));
             }
             // ── list_merge_requests ──────────────────────────────────────────────
             case "list_merge_requests": {
@@ -1967,11 +2133,14 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
             }
             // ── create_merge_request ──────────────────────────────────────────────
             case "create_merge_request": {
-                const { project: projectArg, source_branch, target_branch, title, description, draft = true, labels, assignee_ids, reviewer_ids, remove_source_branch, } = args;
+                const { project: projectArg, source_branch, target_branch, title, description, draft = true, labels, assignees, reviewers, assignee_ids, reviewer_ids, remove_source_branch, } = args;
                 const project = await resolveProject(projectArg, { persist: true });
-                const cleanTitle = title.trim();
-                // The REST API has no draft flag on create; GitLab reads the title prefix.
-                const finalTitle = draft && !/^(draft:|\[draft\]|\(draft\))/i.test(cleanTitle) ? `Draft: ${cleanTitle}` : cleanTitle;
+                const finalTitle = withDraftStatus(title, draft);
+                // Resolve usernames before creating, so an unknown username fails without leaving a half-set-up MR.
+                const [assigneeIds, reviewerIds] = await Promise.all([
+                    mergeUserIds(assignee_ids, assignees),
+                    mergeUserIds(reviewer_ids, reviewers),
+                ]);
                 const mr = await gitlabRequest(`/projects/${project.encoded}/merge_requests`, {
                     method: "POST",
                     body: {
@@ -1980,8 +2149,8 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                         title: finalTitle,
                         description: addAiAuditHeader(description, request.params._meta),
                         labels,
-                        assignee_ids,
-                        reviewer_ids,
+                        assignee_ids: assigneeIds,
+                        reviewer_ids: reviewerIds,
                         remove_source_branch,
                     },
                 });
@@ -1989,6 +2158,71 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                     `✅ Merge request created in **${project.raw}**: **!${mr.iid} — ${mr.title}**`,
                     `- **Branches:** \`${mr.source_branch}\` → \`${mr.target_branch}\``,
                     `- **Draft:** ${mr.draft ? "yes" : "no"}`,
+                    `- **Assignees:** ${formatUsernames(mr.assignees)}`,
+                    `- **Reviewers:** ${formatUsernames(mr.reviewers)}`,
+                    `- **URL:** ${mr.web_url}`,
+                ].join("\n"));
+            }
+            // ── update_merge_request ──────────────────────────────────────────────
+            case "update_merge_request": {
+                const { project: projectArg, title, description, draft, target_branch, labels, add_labels, remove_labels, assignees, reviewers, assignee_ids, reviewer_ids, remove_source_branch, state_event, } = args;
+                const iid = getNumericIdentifier(args, ["iid"], "Merge request IID");
+                const project = await resolveProject(projectArg, { persist: true });
+                const mrPath = `/projects/${project.encoded}/merge_requests/${iid}`;
+                const newTitle = title?.trim() || undefined;
+                const [assigneeIds, reviewerIds] = await Promise.all([
+                    mergeUserIds(assignee_ids, assignees),
+                    mergeUserIds(reviewer_ids, reviewers),
+                ]);
+                // An empty assignee or reviewer list is a real update (it clears them), so check those separately.
+                const hasUpdates = assigneeIds !== undefined ||
+                    reviewerIds !== undefined ||
+                    [
+                        newTitle,
+                        description,
+                        draft,
+                        target_branch,
+                        labels,
+                        add_labels,
+                        remove_labels,
+                        remove_source_branch,
+                        state_event,
+                    ].some(hasDefinedValue);
+                if (!hasUpdates) {
+                    throw new types_js_1.McpError(types_js_1.ErrorCode.InvalidParams, "No merge request updates were provided. Pass at least one field such as `title`, `description`, `draft`, `labels`, `assignees`, `reviewers`, or `state_event`.");
+                }
+                // Draft status lives in the title, so a title or draft change needs the current title and status.
+                let finalTitle;
+                if (newTitle !== undefined || draft !== undefined) {
+                    const current = await gitlabRequest(mrPath);
+                    const currentlyDraft = current.draft ?? DRAFT_TITLE_PREFIX.test(current.title);
+                    // Renaming without `draft` must not silently mark a draft MR as ready.
+                    const wantDraft = draft ?? (currentlyDraft || (newTitle !== undefined && DRAFT_TITLE_PREFIX.test(newTitle)));
+                    finalTitle = withDraftStatus(newTitle ?? current.title, wantDraft);
+                }
+                const mr = await gitlabRequest(mrPath, {
+                    method: "PUT",
+                    body: {
+                        title: finalTitle,
+                        description: addAiAuditHeader(description, request.params._meta),
+                        target_branch,
+                        labels,
+                        add_labels,
+                        remove_labels,
+                        assignee_ids: assigneeIds,
+                        reviewer_ids: reviewerIds,
+                        remove_source_branch,
+                        state_event,
+                    },
+                });
+                return textResult([
+                    `✅ Merge request updated in **${project.raw}**: **!${mr.iid} — ${mr.title}**`,
+                    `- **State:** ${mr.state}`,
+                    `- **Draft:** ${mr.draft ? "yes" : "no"}`,
+                    `- **Branches:** \`${mr.source_branch}\` → \`${mr.target_branch}\``,
+                    `- **Labels:** ${mr.labels.join(", ") || "none"}`,
+                    `- **Assignees:** ${formatUsernames(mr.assignees)}`,
+                    `- **Reviewers:** ${formatUsernames(mr.reviewers)}`,
                     `- **URL:** ${mr.web_url}`,
                 ].join("\n"));
             }

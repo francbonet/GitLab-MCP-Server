@@ -8,7 +8,7 @@ The result is simple:
 
 - Your agent works on live GitLab data instead of pasted context.
 - You can move across repositories in the organization from the same conversation.
-- Comments and issue descriptions written by the agent are marked for audit.
+- Comments, issue descriptions, and merge request descriptions written by the agent are marked for audit.
 - The control surface lives in tools, not in ad-hoc copy/paste.
 
 All access is still constrained by the GitLab user and token you provide. This server does not bypass GitLab permissions.
@@ -42,6 +42,7 @@ With this server, the agent can do the work against GitLab directly:
 - Read a live project catalog resource at `gitlab://projects/catalog` to map natural repository names to full GitLab paths.
 - Resolve repository names like `group-name/project-name`, natural forms like `group-name project-name`, short names like `project-name`, or full GitLab URLs on the configured host when unambiguous.
 - List the exact labels available in a project before using them in issue filters.
+- Find project members by name to get the username to use as an MR assignee or reviewer.
 - Retry issue lookups across matching project candidates when a natural project hint resolves to the wrong repository on the first pass.
 - Keep an active project in the current MCP session so follow-up requests can stay natural.
 
@@ -64,6 +65,9 @@ With this server, the agent can do the work against GitLab directly:
 - Read the full diff of an MR.
 - Read MR comments.
 - Add MR comments.
+- Open a merge request from a branch already pushed to the remote, with a title, a description, assignees, and reviewers (by GitLab username). It opens as a draft by default.
+- Upload screenshots or short videos and embed them in an MR description, issue, or comment.
+- Update an MR: title, description, labels, assignees, reviewers, or target branch. Mark a draft as ready (or back to draft), and close or reopen it.
 
 ### CI and repository workflows
 
@@ -84,6 +88,8 @@ Examples of real agent workflows you can run with the current tools:
 - Investigate a failing pipeline by reading recent runs and jobs.
 - Pull a remote file from the repo to give the agent code context before answering.
 - Update issue metadata after analysis, for example labels, due date, assignees, or close/reopen state.
+- Open a draft MR for a pushed branch, with screenshots of the change in the description and the right assignees and reviewers.
+- Mark the draft MR as ready for review once the work is done.
 
 Example prompts:
 
@@ -94,6 +100,8 @@ Example prompts:
 - `Add a comment with the action plan`
 - `List open merge requests`
 - `Open the diff for MR 42`
+- `Open a draft MR from feature/login into main, attach this screenshot, assign it to Joan, and ask Marta to review it`
+- `Mark MR 42 as ready for review`
 - `Show me the latest pipeline for main`
 - `Read src/index.ts from the current repository`
 - `Switch to the group-name/another-project project`
@@ -116,6 +124,7 @@ Example prompts:
 | `clear_active_project` | Clear the active project stored in the current MCP session |
 | `list_projects` | Search projects available to the authenticated user, optionally scoped to a specific group |
 | `list_labels` | List the exact labels available in the active project, optionally filtered by name |
+| `list_project_members` | List people with access to the project (including inherited group members) with name, username, user ID, and role, optionally filtered by name |
 
 ### Issue tools
 
@@ -139,6 +148,8 @@ Example prompts:
 | `get_merge_request_diff` | Read the full MR diff |
 | `get_merge_request_comments` | Read MR discussion comments |
 | `add_merge_request_comment` | Add an audited comment to an MR |
+| `create_merge_request` | Open an MR from a branch that already exists on the remote, with title, description, labels, `assignees`, and `reviewers` (GitLab usernames). Opens as a draft unless `draft` is `false`, and the description gets the audit header |
+| `update_merge_request` | Update an MR's title, description, labels, assignees, reviewers, target branch, or state. `draft: false` marks it as ready, `draft: true` turns it back into a draft. Does not merge |
 
 ### CI tools
 
@@ -153,6 +164,7 @@ Example prompts:
 |---|---|
 | `get_file_contents` | Read a repository file at a specific branch, tag, or commit |
 | `list_branches` | List branches and search by name |
+| `upload_file` | Upload a local image or video to the project and return Markdown that embeds it in an issue, comment, or MR description |
 
 ---
 
@@ -195,6 +207,8 @@ This currently applies to:
 - Issue comments
 - Issue descriptions on create
 - Issue descriptions on update
+- Merge request descriptions on create
+- Merge request descriptions on update
 
 The audit header includes:
 
@@ -387,11 +401,14 @@ Codex launches the MCP server command when needed. You do not need to keep a sep
 - The server targets the GitLab REST API v4 for most operations, and the GitLab GraphQL API for Work Item Status.
 - All list-style tools default to `per_page=20` and support up to `100` where GitLab allows it.
 - `get_issue`, `get_issue_status`, and `get_issue_comments` accept `iid`, `issue`, or `ticket` as the issue identifier.
-- Invalid project-selection errors are returned as tool text so the agent can recover more gracefully.
-- GitLab API permission errors are also surfaced back as tool text rather than opaque failures.
+- Invalid project-selection errors, invalid arguments, and GitLab API errors (for example missing permissions) are returned as tool results with `isError: true`. The agent can read the message and recover, and the client still records the call as failed.
 - `list_projects` can still be scoped explicitly with a `group` argument when the user wants to narrow discovery to a specific organization or subgroup.
 - System notes are filtered out from issue and MR comment reads; only user-authored comments are returned.
 - File contents returned by `get_file_contents` are automatically base64-decoded.
+- `create_merge_request` does not push branches: the source branch must already exist on the remote.
+- The GitLab REST API has no draft flag, so the server sets draft status through the `Draft: ` title prefix. `update_merge_request` adds or removes it when `draft` is passed. A new `title` without `draft` keeps the current status, so renaming a draft never marks it as ready by accident.
+- `assignees` and `reviewers` take GitLab usernames (with or without `@`), which the server resolves to user IDs. If one username does not exist, the call fails before anything is created or changed. On `update_merge_request`, these lists replace the current ones, and an empty list removes everyone. `assignee_ids` and `reviewer_ids` are still accepted as an alternative.
+- `upload_file` only accepts absolute paths and PNG, JPEG, GIF, WebP, or MP4 files of at most 10 MB. The returned Markdown only renders inside the same project it was uploaded to.
 
 ### Work Item Status
 
@@ -399,7 +416,7 @@ The **Status** field (e.g. `In Dev Review`, `Ready for QA`) is part of GitLab's 
 
 `get_issue` fetches the Work Item Status automatically in the background and includes it in the response when available. `get_issue_status` provides a dedicated tool to query only the status of a single issue. `list_work_item_statuses` retrieves all work items in a project with their statuses in a single GraphQL call — useful for a full status overview.
 
-If a project does not have the Work Items feature or the Status widget enabled, the status field will be absent from `get_issue`, and `get_issue_status` and `set_work_item_status` will return a descriptive message instead of failing.
+If a project does not have the Work Items feature or the Status widget enabled, the status field will be absent from `get_issue`, and `get_issue_status` will return a descriptive message instead of failing.
 
 ---
 

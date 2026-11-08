@@ -88,6 +88,7 @@ Examples of real agent workflows you can run with the current tools:
 - Investigate a failing pipeline by reading recent runs and jobs.
 - Pull a remote file from the repo to give the agent code context before answering.
 - Update issue metadata after analysis, for example labels, due date, assignees, or close/reopen state.
+- Move a ticket to the next Work Item Status, for example `In Dev Review` once the MR is open.
 - Open a draft MR for a pushed branch, with screenshots of the change in the description and the right assignees and reviewers.
 - Mark the draft MR as ready for review once the work is done.
 
@@ -98,6 +99,7 @@ Example prompts:
 - `Show me ticket 128`
 - `Summarize the ticket comments and propose next steps`
 - `Add a comment with the action plan`
+- `Move ticket 128 to In Dev Review`
 - `List open merge requests`
 - `Open the diff for MR 42`
 - `Open a draft MR from feature/login into main, attach this screenshot, assign it to Joan, and ask Marta to review it`
@@ -134,6 +136,7 @@ Example prompts:
 | `get_issue` | Read a full issue or ticket by IID, including Work Item Status, iteration, checklist progress, related MRs, and linked issues |
 | `list_work_item_statuses` | List all work items with their Work Item Status in a single GraphQL call — useful for a full project status overview |
 | `get_issue_status` | Read the Work Item Status of a specific issue (e.g. `In Dev Review`, `Ready for QA`) via GraphQL |
+| `update_issue_status` | Set the Work Item Status of an issue by name (e.g. `In Dev Review`). Fails and lists the valid statuses if the name is not allowed for that ticket |
 | `get_issue_comments` | Read issue comments in chronological order |
 | `create_issue` | Create a new issue |
 | `add_issue_comment` | Add an audited comment to an issue |
@@ -400,7 +403,7 @@ Codex launches the MCP server command when needed. You do not need to keep a sep
 
 - The server targets the GitLab REST API v4 for most operations, and the GitLab GraphQL API for Work Item Status.
 - All list-style tools default to `per_page=20` and support up to `100` where GitLab allows it.
-- `get_issue`, `get_issue_status`, and `get_issue_comments` accept `iid`, `issue`, or `ticket` as the issue identifier.
+- `get_issue`, `get_issue_status`, `update_issue_status`, and `get_issue_comments` accept `iid`, `issue`, or `ticket` as the issue identifier.
 - Invalid project-selection errors, invalid arguments, and GitLab API errors (for example missing permissions) are returned as tool results with `isError: true`. The agent can read the message and recover, and the client still records the call as failed.
 - `list_projects` can still be scoped explicitly with a `group` argument when the user wants to narrow discovery to a specific organization or subgroup.
 - System notes are filtered out from issue and MR comment reads; only user-authored comments are returned.
@@ -417,6 +420,8 @@ The **Status** field (e.g. `In Dev Review`, `Ready for QA`) is part of GitLab's 
 `get_issue` fetches the Work Item Status automatically in the background and includes it in the response when available. `get_issue_status` provides a dedicated tool to query only the status of a single issue. `list_work_item_statuses` retrieves all work items in a project with their statuses in a single GraphQL call — useful for a full status overview.
 
 If a project does not have the Work Items feature or the Status widget enabled, the status field will be absent from `get_issue`, and `get_issue_status` will return a descriptive message instead of failing.
+
+`update_issue_status` changes the status by name. It reads the statuses allowed for that ticket's work item type (including custom status lifecycles), matches the name case-insensitively, and sends the `workItemUpdate` mutation with that status's global ID. If no allowed status matches, it fails and lists the valid ones. If the ticket already has that status, nothing is changed. The response shows the previous status and the status GitLab returns after the update.
 
 ---
 

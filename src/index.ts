@@ -1012,6 +1012,75 @@ async function fetchWorkItemStatus(
   }
 }
 
+interface WorkItemStatusOption {
+  id: string;
+  name: string;
+}
+
+type WorkItemStatusWidget = { status?: WorkItemStatusOption | null };
+
+// Allowed statuses come from the work item type's Status widget definition and are
+// resolved in the work item's namespace, so custom lifecycles are respected.
+const WORK_ITEM_ALLOWED_STATUSES_QUERY = `
+  query GetWorkItemAllowedStatuses($fullPath: ID!, $iids: [String!]) {
+    project(fullPath: $fullPath) {
+      workItems(iids: $iids) {
+        nodes {
+          id
+          iid
+          title
+          webUrl
+          workItemType {
+            widgetDefinitions {
+              ... on WorkItemWidgetDefinitionStatus {
+                allowedStatuses {
+                  id
+                  name
+                }
+              }
+            }
+          }
+          widgets {
+            ... on WorkItemWidgetStatus {
+              status {
+                id
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const WORK_ITEM_UPDATE_STATUS_MUTATION = `
+  mutation UpdateWorkItemStatus($id: WorkItemID!, $status: WorkItemsStatusesStatusID!) {
+    workItemUpdate(input: { id: $id, statusWidget: { status: $status } }) {
+      errors
+      workItem {
+        widgets {
+          ... on WorkItemWidgetStatus {
+            status {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+function findWorkItemStatus(widgets: WorkItemStatusWidget[] | undefined): WorkItemStatusOption | null {
+  return widgets?.find((w) => w.status != null)?.status ?? null;
+}
+
+/** Case- and whitespace-insensitive, so "in dev review" matches "In Dev Review" */
+function normalizeStatusName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 /** GET that resolves to null on any error, for optional enrichment data */
 async function gitlabRequestOptional<T>(path: string, options?: GitLabApiOptions): Promise<T | null> {
   try {
@@ -1815,6 +1884,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "Alias for the internal issue ID (IID)",
           },
         },
+      },
+    },
+    {
+      name: "update_issue_status",
+      description:
+        `Set the Work Item Status of a GitLab issue or ticket by name (e.g. "In Dev Review", "Ready for QA"). The name is matched case-insensitively against the statuses allowed for that ticket; if it doesn't match, the call fails and lists the valid statuses. Returns the status GitLab reports after the update. Uses the GraphQL Work Items API because the status field is not available in the REST API. ${explicitProjectGuidance}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: projectInputSchema,
+          iid: {
+            type: "number",
+            description: "The internal ID (IID) of the issue",
+          },
+          issue: {
+            type: "number",
+            description: "Alias for the internal issue ID (IID)",
+          },
+          ticket: {
+            type: "number",
+            description: "Alias for the internal issue ID (IID)",
+          },
+          status: {
+            type: "string",
+            description: "Name of the target status, for example `In Dev Review`",
+          },
+        },
+        required: ["status"],
       },
     },
     {
@@ -2927,6 +3024,113 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             `**Work Item Status:** ${statusName ?? "_(no status set — the Status widget may not be enabled for this project)_"}`,
           ].join("\n")
         );
+      }
+
+      // ── update_issue_status ──────────────────────────────────────────────
+      case "update_issue_status": {
+        const { project: projectArg, status: requestedStatus } = args as {
+          project?: string;
+          status?: string;
+        };
+        const iid = getNumericIdentifier(args as Record<string, unknown>, ["iid", "issue", "ticket"], "Issue IID");
+
+        if (typeof requestedStatus !== "string" || !requestedStatus.trim()) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Status is required. Pass `status` with the status name, for example `In Dev Review`."
+          );
+        }
+
+        const project = await resolveProject(projectArg, { persist: true });
+
+        const data = await gitlabGraphQL<{
+          project: {
+            workItems: {
+              nodes: Array<{
+                id: string;
+                iid: string;
+                title: string;
+                webUrl: string | null;
+                workItemType: {
+                  widgetDefinitions: Array<{ allowedStatuses?: WorkItemStatusOption[] | null }> | null;
+                };
+                widgets: WorkItemStatusWidget[];
+              }>;
+            } | null;
+          } | null;
+        }>(WORK_ITEM_ALLOWED_STATUSES_QUERY, { fullPath: project.raw, iids: [String(iid)] });
+
+        const workItem = data?.project?.workItems?.nodes?.[0];
+        if (!workItem) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Work item #${iid} was not found in ${project.raw} via the GraphQL Work Items API. Make sure the issue exists and the Work Items feature is enabled for this project.`
+          );
+        }
+
+        const allowedStatuses =
+          workItem.workItemType.widgetDefinitions?.find((d) => d.allowedStatuses != null)?.allowedStatuses ?? [];
+        if (allowedStatuses.length === 0) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Work item #${iid} in ${project.raw} has no allowed statuses. The Status widget may not be enabled for this project.`
+          );
+        }
+
+        const wanted = normalizeStatusName(requestedStatus);
+        const target = allowedStatuses.find((s) => normalizeStatusName(s.name) === wanted);
+        if (!target) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `Status "${requestedStatus.trim()}" is not allowed for #${iid} in ${project.raw}. Valid statuses: ${allowedStatuses
+              .map((s) => `"${s.name}"`)
+              .join(", ")}.`
+          );
+        }
+
+        const previous = findWorkItemStatus(workItem.widgets);
+        const header = [
+          `## Work Item Status for #${iid}: ${workItem.title}`,
+          "",
+          `**Project:** ${project.raw}`,
+          ...(workItem.webUrl ? [`**URL:** ${workItem.webUrl}`] : []),
+        ];
+
+        if (previous?.id === target.id) {
+          return textResult(
+            [...header, `**Work Item Status:** ${target.name} _(already set — no change made)_`].join("\n")
+          );
+        }
+
+        const result = await gitlabGraphQL<{
+          workItemUpdate: {
+            errors: string[];
+            workItem: { widgets: WorkItemStatusWidget[] } | null;
+          } | null;
+        }>(WORK_ITEM_UPDATE_STATUS_MUTATION, { id: workItem.id, status: target.id });
+
+        const mutationErrors = result?.workItemUpdate?.errors ?? [];
+        if (mutationErrors.length > 0) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `GitLab rejected the status update for #${iid}: ${mutationErrors.join(", ")}`
+          );
+        }
+
+        const finalStatus = findWorkItemStatus(result?.workItemUpdate?.workItem?.widgets);
+        const lines = [
+          ...header,
+          `**Previous Status:** ${previous?.name ?? "_(not set)_"}`,
+          `**Work Item Status:** ${finalStatus?.name ?? "_(not returned by GitLab)_"}`,
+        ];
+        if (finalStatus?.id !== target.id) {
+          lines.push(
+            "",
+            `⚠️ GitLab reported a different status than requested ("${target.name}"). Check the ticket with \`get_issue_status\`.`
+          );
+        }
+
+        return textResult(lines.join("\n"));
       }
 
       // ── create_issue ─────────────────────────────────────────────────────

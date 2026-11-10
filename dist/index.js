@@ -863,6 +863,24 @@ async function mergeUserIds(ids, usernames) {
     const resolved = await resolveUserIds(names);
     return [...new Set([...(ids ?? []), ...resolved])];
 }
+/** Where a diff thread points, e.g. "`src/a.ts` line 12 (new) at abc12345", or undefined for a general comment. */
+function describeDiffPosition(position) {
+    if (!position)
+        return undefined;
+    const path = position.new_path ?? position.old_path;
+    if (!path)
+        return undefined;
+    const lines = [];
+    if (position.new_line != null)
+        lines.push(`line ${position.new_line} (new)`);
+    if (position.old_line != null)
+        lines.push(`line ${position.old_line} (old)`);
+    if (position.old_path && position.new_path && position.old_path !== position.new_path) {
+        lines.push(`renamed from \`${position.old_path}\``);
+    }
+    const at = position.head_sha ? ` at ${position.head_sha.slice(0, 8)}` : "";
+    return `\`${path}\`${lines.length ? ` ${lines.join(", ")}` : ""}${at}`;
+}
 const projectInputSchema = {
     type: "string",
     description: `Numeric GitLab project ID, namespace/path (for example \`group-name/project-name\`), a natural namespace-and-name form like \`group-name project-name\`, a short project name like \`project-name\`, or a full GitLab URL on this host. If omitted, the active project for the current MCP session is used. When the user names a repository or pastes a GitLab URL, pass \`project\` explicitly. Passing \`project\` also updates that active project. When repository names are ambiguous, consult the \`${PROJECT_CATALOG_URI}\` resource first.`,
@@ -1083,6 +1101,48 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
                     },
                 },
                 required: ["iid", "body"],
+            },
+        },
+        {
+            name: "get_merge_request_discussions",
+            description: `Get the discussion threads of a merge request: each thread's ID, whether it is resolved, the file and line a diff comment points at (with the head SHA it was written against), and every note in it with its note ID, author, and time. Use the thread ID with reply_to_merge_request_discussion. System notes are left out. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    iid: {
+                        type: "number",
+                        description: "The internal ID (IID) of the merge request",
+                    },
+                    unresolved_only: {
+                        type: "boolean",
+                        description: "Return only resolvable threads that are not resolved yet (default false)",
+                    },
+                },
+                required: ["iid"],
+            },
+        },
+        {
+            name: "reply_to_merge_request_discussion",
+            description: `Reply inside an existing merge request thread, by thread ID from get_merge_request_discussions. Replying to a standalone comment turns it into a thread. Replies created through this MCP are automatically marked as AI-generated for audit purposes. Does not resolve the thread. ${explicitProjectGuidance}`,
+            inputSchema: {
+                type: "object",
+                properties: {
+                    project: projectInputSchema,
+                    iid: {
+                        type: "number",
+                        description: "The internal ID (IID) of the merge request",
+                    },
+                    discussion_id: {
+                        type: "string",
+                        description: "The thread ID, as get_merge_request_discussions prints it",
+                    },
+                    body: {
+                        type: "string",
+                        description: "The reply text (Markdown supported)",
+                    },
+                },
+                required: ["iid", "discussion_id", "body"],
             },
         },
         // ── Pipelines ────────────────────────────────────────────────────────────
@@ -1820,6 +1880,52 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                         },
                     ],
                 };
+            }
+            // ── get_merge_request_discussions ────────────────────────────────────
+            case "get_merge_request_discussions": {
+                const { project: projectArg, iid, unresolved_only = false } = args;
+                const project = await resolveProject(projectArg, { persist: true });
+                const discussions = [];
+                const perPage = 100;
+                for (let page = 1;; page += 1) {
+                    const batch = await gitlabRequest(`/projects/${project.encoded}/merge_requests/${iid}/discussions`, { params: { per_page: perPage, page } });
+                    discussions.push(...batch);
+                    if (batch.length < perPage)
+                        break;
+                }
+                const sections = [];
+                for (const discussion of discussions) {
+                    const notes = discussion.notes.filter((n) => !n.system);
+                    if (notes.length === 0)
+                        continue;
+                    const resolvableNotes = notes.filter((n) => n.resolvable);
+                    const resolved = resolvableNotes.length > 0 && resolvableNotes.every((n) => n.resolved);
+                    if (unresolved_only && (resolvableNotes.length === 0 || resolved))
+                        continue;
+                    const state = resolvableNotes.length === 0 ? "not resolvable" : resolved ? "resolved" : "unresolved";
+                    const where = describeDiffPosition(notes[0].position);
+                    const header = [
+                        `### Thread ${discussion.id}`,
+                        `**State:** ${state}${discussion.individual_note ? " (standalone comment)" : ""}`,
+                        `**On:** ${where ?? "the MR as a whole"}`,
+                    ].join("\n");
+                    const body = notes
+                        .map((n) => `**${n.author.username}** (${n.created_at}, note ${n.id}):\n${n.body}`)
+                        .join("\n\n");
+                    sections.push(`${header}\n\n${body}`);
+                }
+                if (sections.length === 0) {
+                    return textResult(unresolved_only ? `No unresolved threads on MR !${iid}.` : `No discussion threads on MR !${iid} yet.`);
+                }
+                return textResult(`## Threads on MR !${iid}\n\n**Project:** ${project.raw}\n**Threads:** ${sections.length}\n\n${sections.join("\n\n---\n\n")}`);
+            }
+            // ── reply_to_merge_request_discussion ────────────────────────────────
+            case "reply_to_merge_request_discussion": {
+                const { project: projectArg, iid, discussion_id, body } = args;
+                const project = await resolveProject(projectArg, { persist: true });
+                const auditedBody = addAiAuditHeader(body, request.params._meta) ?? body;
+                const note = await gitlabRequest(`/projects/${project.encoded}/merge_requests/${iid}/discussions/${encodeURIComponent(discussion_id)}/notes`, { method: "POST", body: { body: auditedBody } });
+                return textResult(`✅ Reply posted in thread ${discussion_id} on MR !${iid} in ${project.raw} by ${note.author.username} at ${note.created_at} (note ID: ${note.id}).`);
             }
             // ── list_pipelines ───────────────────────────────────────────────────
             case "list_pipelines": {

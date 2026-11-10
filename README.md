@@ -152,6 +152,8 @@ Example prompts:
 | `get_merge_request_diff` | Read the full MR diff |
 | `get_merge_request_comments` | Read MR discussion comments |
 | `add_merge_request_comment` | Add an audited comment to an MR |
+| `get_merge_request_discussions` | Read the MR's threads: thread ID, resolved state, the file and line of diff comments (with the head SHA they were written against), and each note's ID, author, and time. `unresolved_only` keeps only open threads |
+| `reply_to_merge_request_discussion` | Add an audited reply inside an existing MR thread by thread ID; replying to a standalone comment turns it into a thread. Does not resolve it |
 | `create_merge_request` | Open an MR from a branch that already exists on the remote, with title, description, labels, `assignees`, and `reviewers` (GitLab usernames). Opens as a draft unless `draft` is `false`, and the description gets the audit header |
 | `update_merge_request` | Update an MR's title, description, labels, assignees, reviewers, target branch, or state. `draft: false` marks it as ready, `draft: true` turns it back into a draft. Does not merge |
 

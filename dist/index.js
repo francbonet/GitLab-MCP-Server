@@ -992,7 +992,7 @@ server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_current_user",
-            description: "Return the GitLab user that owns this server's token — the identity every write through this server acts as — with name, username, and user ID. Use it to find out who \"me\" is, for example before assigning an issue or merge request to the person running the agent.",
+            description: "Return the GitLab user that owns this server's token — the identity every write through this server acts as — with name, username, and user ID. Use it to recognise your own comments and to know which account your writes appear as; with a dedicated bot or agent token this is not the person you work for.",
             inputSchema: {
                 type: "object",
                 properties: {},

@@ -127,6 +127,7 @@ Example prompts:
 | `list_projects` | Search projects available to the authenticated user, optionally scoped to a specific group |
 | `list_labels` | List the exact labels available in the active project, optionally filtered by name |
 | `list_project_members` | List people with access to the project (including inherited group members) with name, username, user ID, and role, optionally filtered by name |
+| `get_current_user` | Return the user that owns the token (name, username, user ID): the identity every write acts as |
 
 ### Issue tools
 

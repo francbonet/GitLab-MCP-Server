@@ -1553,6 +1553,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "get_current_user",
+      description:
+        "Return the GitLab user that owns this server's token — the identity every write through this server acts as — with name, username, and user ID. Use it to find out who \"me\" is, for example before assigning an issue or merge request to the person running the agent.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "list_merge_requests",
       description:
         `List merge requests for a project. Defaults to open MRs and can filter by state and assignee username. ${explicitProjectGuidance}`,
@@ -2270,6 +2279,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      // ── get_current_user ─────────────────────────────────────────────────
+      case "get_current_user": {
+        const user = await gitlabRequest<GitLabUser>("/user");
+        return textResult(
+          [
+            "## Current user",
+            "",
+            `**${user.name}** (@${user.username}) — user ID ${user.id}`,
+          ].join("\n")
+        );
       }
 
       // ── list_project_members ─────────────────────────────────────────────
